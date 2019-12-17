@@ -1,0 +1,14 @@
+[package]
+name = "pppoe-client"
+version = "0.1.0"
+authors = ["Istvan Ruzman <istvan@ruzman.eu>"]
+edition = "2018"
+license = "Apache-2.0 OR MIT"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+pppoe = { git = "https://github.com/Istvan91/pppoe-rs", features = ["async", "tr101", "socket"] }
+tokio = { version = "0.2", features = ["io-driver", "macros", "rt-core", "time"] }
+futures = "0.3"
+mio = "0.6"
