@@ -7,6 +7,7 @@ pub use session::Session;
 use std::num::NonZeroU16;
 use std::time::Duration;
 
+#[derive(Default)]
 pub struct Configuration {
     pub padi_retry: u16,
     pub padr_retry: u16,
