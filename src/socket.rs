@@ -19,18 +19,14 @@ impl Socket {
         self.io.get_ref().mac_address()
     }
 
-    pub async fn send(&self, packet: &pppoe::Packet<'_>) -> io::Result<usize> {
+    pub async fn send(&self, packet: &[u8]) -> io::Result<usize> {
         poll_fn(|ctx| self.poll_send(ctx, packet)).await
     }
 
-    pub fn poll_send(
-        &self,
-        ctx: &mut Context<'_>,
-        packet: &pppoe::Packet<'_>,
-    ) -> Poll<io::Result<usize>> {
+    pub fn poll_send(&self, ctx: &mut Context<'_>, packet: &[u8]) -> Poll<io::Result<usize>> {
         ready!(self.io.poll_write_ready(ctx))?;
 
-        match self.io.get_ref().send(packet.as_bytes()) {
+        match self.io.get_ref().send(packet) {
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 self.io.clear_write_ready(ctx)?;
                 Poll::Pending
