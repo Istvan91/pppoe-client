@@ -1,8 +1,9 @@
 use futures::{future::poll_fn, ready};
 use tokio::io::PollEvented;
 
-use std::io;
+use std::{io, num};
 use std::task::{Context, Poll};
+use std::os::unix::io::RawFd;
 
 pub struct Socket {
     io: PollEvented<pppoe::Socket>,
@@ -17,6 +18,10 @@ impl Socket {
 
     pub fn mac_address(&self) -> [u8; 6] {
         self.io.get_ref().mac_address()
+    }
+
+    pub fn connect_session_id(&mut self, session_id: num::NonZeroU16, remote_mac: [u8; 6]) -> io::Result<RawFd> {
+        self.io.get_mut().connect_session(session_id, remote_mac)
     }
 
     pub async fn send(&self, packet: &[u8]) -> io::Result<usize> {
@@ -49,6 +54,10 @@ impl Socket {
             }
             x => Poll::Ready(x),
         }
+    }
+
+    pub fn close(&mut self) {
+        self.io.get_mut().close()
     }
 }
 

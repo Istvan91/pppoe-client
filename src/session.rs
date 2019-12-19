@@ -3,6 +3,7 @@ use tokio::time;
 use crate::{Configuration, Socket};
 use pppoe::error::Error;
 use std::{self, io, num};
+use std::os::unix::io::RawFd;
 
 pub struct Session {
     socket: Socket,
@@ -129,7 +130,7 @@ impl Session {
         .await
     }
 
-    pub async fn connect(&self) -> u16 {
+    pub async fn connect(&mut self) -> io::Result<RawFd> {
         let mut send_buffer = [0u8; 1500];
         let mut recv_buffer = [0u8; 1500];
 
@@ -152,7 +153,14 @@ impl Session {
 
             match self.wait_for_pads(&packet, &mut recv_buffer).await {
                 Ok(pads) => {
-                    return pads.pppoe_header().session_id();
+                    let session_id = pads.pppoe_header().session_id();
+                    if session_id == 0 { continue }
+
+                    self.socket.close();
+
+                    return self.socket.connect_session_id(
+                        num::NonZeroU16::new(session_id).unwrap(),
+                        pads.ethernet_header().src_address());
                 }
                 _ => continue,
             }

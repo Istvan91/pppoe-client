@@ -17,6 +17,6 @@ async fn main() {
         host_uniq: Some(b"n23fq98i\0\0ae90123n   4khtn21t\0\0".to_vec()),
     };
 
-    let session = Session::new(config, "pppoe").unwrap();
-    println!("{}, session_id", session.connect().await);
+    let mut session = Session::new(config, "pppoe").unwrap();
+    println!("{:?}, session_id", session.connect().await);
 }
