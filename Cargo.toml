@@ -10,8 +10,8 @@ name = "pppoe_client"
 path = "src/lib.rs"
 
 [[bin]]
-name = "pppoe-client-bin"
-path = "src/client.rs"
+name = "pppoe-discover-bin"
+path = "src/pppoe-discover.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

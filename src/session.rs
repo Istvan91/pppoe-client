@@ -2,7 +2,7 @@ use tokio::time;
 
 use crate::{Configuration, Socket};
 use pppoe::error::Error;
-use std::{self, io, num};
+use std::{self, io, num, future};
 use std::os::unix::io::RawFd;
 
 pub struct Session {
@@ -30,7 +30,13 @@ impl Session {
         header.add_tag(pppoe::Tag::EndOfList).map_err(Into::into)
     }
 
-    fn create_padi(&self, packet: &mut pppoe::PacketBuilder) -> Result<(), Error> {
+    fn create_padi<'a>(&self, send_buffer: &'a mut [u8]) -> Result<pppoe::PacketBuilder<'a>, Error> {
+        let mut packet = pppoe::PacketBuilder::new_discovery_packet(
+            send_buffer,
+            self.socket.mac_address(),
+            [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+        )?;
+
         let padi = packet.pppoe_header();
 
         match &self.config.service_name {
@@ -38,7 +44,9 @@ impl Session {
             None => padi.add_tag(pppoe::Tag::ServiceName(b""))?,
         };
 
-        self.add_tags(padi)
+        self.add_tags(padi)?;
+
+        Ok(packet)
     }
 
     fn create_padr(
@@ -56,111 +64,115 @@ impl Session {
         self.add_tags(&mut padr)
     }
 
-    async fn wait_for_packet<'a>(
-        &self,
-        packet: &pppoe::PacketBuilder<'_>,
-        recv_buffer: &'a mut [u8],
-        code: pppoe::Code,
-    ) -> Result<usize, Error> {
-        self.socket.send(packet.as_bytes()).await;
+    async fn recv<'a>(&self, buffer: &'a mut [u8], code: pppoe::Code) -> Result<pppoe::Packet<'a>, Error> {
 
-        loop {
-            let len = self.socket.recv(&mut recv_buffer[..]).await.unwrap();
-            let received = pppoe::Packet::with_buffer(&mut recv_buffer[..len]);
-            if let Ok(received) = &received {
-                if self.packet_is_for_me(received) && received.pppoe_header().code() == code as u8 {
-                    return Ok(len);
+        let len = self.socket.recv(buffer).await?;
+        
+        let packet = pppoe::Packet::with_buffer(&buffer[..len])?;
+        if self.packet_is_for_me(&packet) && packet.pppoe_header().code() == code as u8 {
+            return Ok(packet);
+        }
+        unimplemented!()
+    }
+
+
+    async fn wait_for_packets<'a, F>(&self, code: pppoe::Code, send_buffer: &[u8], recv_buffer: &'a mut [u8], timeout: std::time::Duration, retries: u16, mut check_packet: F) -> Result<pppoe::Packet<'a>, Error>
+        where F: FnMut(&pppoe::Packet) -> bool
+    {
+        let mut counter = 0;
+        let len = 'outer: loop {
+            if retries != 0 && counter == retries {
+                unimplemented!() // return TimeoutError
+            }
+
+            self.socket.send(send_buffer).await?;
+
+            let timeout = time::Instant::now() + timeout;
+            loop {
+                match time::timeout_at(timeout, self.recv(recv_buffer, code)).await {
+                    Ok(packet) => {
+                        if let Ok(packet) = packet {
+                            if check_packet(&packet) { break 'outer packet.len() }
+                        }
+                    }
+                    Err(_) => break,
                 }
             }
-        }
-    }
 
-    pub async fn wait_for_packet_with_time_control<'a>(
-        &self,
-        packet: &pppoe::PacketBuilder<'_>,
-        recv_buffer: &'a mut [u8],
-        code: pppoe::Code,
-        timeout: std::time::Duration,
-        retries: u16,
-    ) -> Result<pppoe::Packet<'a>, Error> {
-        let counter = 0;
-
-        let len = loop {
-            if retries != 0 && counter >= retries {
-                unimplemented!()
-            };
-
-            match time::timeout(timeout, self.wait_for_packet(packet, recv_buffer, code)).await {
-                Ok(received) => break received.unwrap(),
-                _timeout => (),
-            }
-            counter.wrapping_add(1);
+            counter += 1;
         };
-        pppoe::Packet::with_buffer(&mut recv_buffer[..len])
+
+        pppoe::Packet::with_buffer(&recv_buffer[..len])
     }
 
-    pub async fn wait_for_pado<'a>(
-        &self,
-        padi: &pppoe::PacketBuilder<'_>,
-        recv_buffer: &'a mut [u8],
-    ) -> Result<pppoe::Packet<'a>, Error> {
-        let cfg = &self.config;
-        self.wait_for_packet_with_time_control(
-            padi,
-            recv_buffer,
-            pppoe::Code::Pado,
-            cfg.pado_timeout,
-            cfg.padi_retry,
-        )
-        .await
+
+    async fn discover_internal<'a, F>(&self, send_buffer: &mut [u8], recv_buffer: &'a mut [u8], check_packet: F) -> Result<pppoe::Packet<'a>, Error>
+        where F: FnMut(&pppoe::Packet) -> bool
+    {
+
+        let packet = self.create_padi(send_buffer).unwrap();
+
+        self.wait_for_packets(pppoe::Code::Pado, packet.as_bytes(), recv_buffer, self.config.pado_timeout, self.config.padi_retry, check_packet).await
     }
 
-    pub async fn wait_for_pads<'a>(
-        &self,
-        padr: &pppoe::PacketBuilder<'_>,
-        recv_buffer: &'a mut [u8],
-    ) -> Result<pppoe::Packet<'a>, Error> {
-        self.wait_for_packet_with_time_control(
-            padr,
-            recv_buffer,
-            pppoe::Code::Pads,
-            self.config.pads_timeout,
-            self.config.padr_retry,
-        )
-        .await
+
+    pub async fn discover<'a, F>(&mut self, check_packet: F) -> Result<(), Error>
+        where F: FnMut(&pppoe::Packet) -> bool
+    {
+        let recv_buffer = &mut [0u8; 1500][..];
+        let send_buffer = &mut [0u8; 200][..];
+
+        self.discover_internal(send_buffer, recv_buffer, check_packet).await
+            .map(|_| ())
     }
 
-    pub async fn connect(&mut self) -> io::Result<RawFd> {
-        let mut send_buffer = [0u8; 1500];
-        let mut recv_buffer = [0u8; 1500];
 
-        let mut packet = pppoe::PacketBuilder::new_discovery_packet(
-            &mut send_buffer[..],
-            self.socket.mac_address(),
-            [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
-        )
-        .unwrap();
+    pub async fn connect(&mut self) -> Result<RawFd, Error> {
+        let send_buffer = &mut [0u8; 1500][..];
+        let recv_buffer = &mut [0u8; 1500][..];
 
         loop {
-            self.create_padi(&mut packet).unwrap();
+            let pado = self.discover_internal(
+                send_buffer,
+                recv_buffer,
+                |packet| {
 
-            let pado = self.wait_for_pado(&packet, &mut recv_buffer).await.unwrap();
+                    if let Some(ref expected_service_name) = self.config.service_name {
+                        for tag in packet.pppoe_header().tags() {
+                            if let pppoe::Tag::ServiceName(service_name) = tag {
+                                if service_name == expected_service_name.as_bytes() {
+                                    return true;
+                                }
+                            }
+                        }
+                        return false;
+                    }
+                    true
+                }
+            ).await?;
 
-            packet
-                .ethernet_header()
-                .set_dst_address(pado.ethernet_header().src_address());
-            self.create_padr(&mut packet, &pado).unwrap();
+            let mut packet = pppoe::PacketBuilder::new_discovery_packet(
+                send_buffer,
+                pado.ethernet_header().dst_address(),
+                pado.ethernet_header().src_address(),
+            )?;
 
-            match self.wait_for_pads(&packet, &mut recv_buffer).await {
+            self.create_padr(&mut packet, &pado)?;
+
+            // self.establish_session(&packet)
+            let pads = self.wait_for_packets(pppoe::Code::Pads, send_buffer, recv_buffer, self.config.pads_timeout, self.config.padr_retry, |_| true).await;
+
+            match pads {
                 Ok(pads) => {
                     let session_id = pads.pppoe_header().session_id();
-                    if session_id == 0 { continue }
+                    if session_id == 0 {  }
 
                     self.socket.close();
 
                     return self.socket.connect_session_id(
                         num::NonZeroU16::new(session_id).unwrap(),
-                        pads.ethernet_header().src_address());
+                        pads.ethernet_header().src_address())
+                        .map_err(Into::into);
                 }
                 _ => continue,
             }
@@ -168,7 +180,7 @@ impl Session {
     }
 
     fn packet_is_for_me(&self, received: &pppoe::Packet) -> bool {
-        if received.ethernet_header().dst_address() != &self.socket.mac_address() {
+        if received.ethernet_header().dst_address() != self.socket.mac_address() {
             return false;
         }
 
@@ -179,7 +191,7 @@ impl Session {
         }
 
         if let Some(host_uniq) = &self.config.host_uniq {
-            for tag in received.pppoe_header().tag_iter() {
+            for tag in received.pppoe_header().tags() {
                 if let pppoe::Tag::HostUniq(r_uniq) = tag {
                     return host_uniq == &r_uniq;
                 }
